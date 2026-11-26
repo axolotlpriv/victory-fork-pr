@@ -535,6 +535,484 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     CONTINUE_EXECUTION
 }
 
+/// Outcome of static AOT console-instruction scanning or translation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AotReport {
+    pub clzero_loops: usize,
+    pub clzero_preinc_loops: usize,
+    pub waits: usize,
+    pub insertq: usize,
+    pub patched: usize,
+}
+
+impl AotReport {
+    /// Total statically translatable console-only instruction sites found.
+    pub fn total(&self) -> usize {
+        self.clzero_loops + self.clzero_preinc_loops + self.waits + self.insertq
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AotKind {
+    ClzeroLoop { cmp: [u8; 3] },
+    ClzeroPreIncLoop { code: [u8; 15], ptr_reg: u8, end_reg: u8 },
+    Wait { replacement: [u8; 3] },
+    Insertq { dst: u8, src: u8, len: u8, idx: u8 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AotSite {
+    pub(crate) rva: usize,
+    pub(crate) len: usize,
+    pub(crate) kind: AotKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CpuSupport {
+    clzero: bool,
+    mwaitx: bool,
+    sse4a: bool,
+}
+
+fn host_cpu_support() -> CpuSupport {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: `cpuid` is always supported on x86_64.
+        unsafe {
+            let max_ext = std::arch::x86_64::__cpuid(0x8000_0000).eax;
+            let ext1 = if max_ext >= 0x8000_0001 {
+                std::arch::x86_64::__cpuid(0x8000_0001).ecx
+            } else {
+                0
+            };
+            let ext8 = if max_ext >= 0x8000_0008 {
+                std::arch::x86_64::__cpuid(0x8000_0008).ebx
+            } else {
+                0
+            };
+            CpuSupport {
+                sse4a: ext1 & (1 << 6) != 0,
+                mwaitx: ext1 & (1 << 29) != 0,
+                clzero: ext8 & 1 != 0,
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        CpuSupport {
+            clzero: true,
+            mwaitx: true,
+            sse4a: true,
+        }
+    }
+}
+
+fn parse_pdata(bytes: &[u8]) -> Vec<(u32, u32)> {
+    let mut funcs = Vec::with_capacity(bytes.len() / 12);
+    for chunk in bytes.chunks_exact(12) {
+        let begin = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let end = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        if begin < end {
+            funcs.push((begin, end));
+        }
+    }
+    funcs.sort_unstable_by_key(|&(b, _)| b);
+    funcs
+}
+
+fn in_sorted_ranges(ranges: &[(u32, u32)], rva: u32) -> bool {
+    let i = ranges.partition_point(|&(b, _)| b <= rva);
+    i > 0 && rva < ranges[i - 1].1
+}
+
+/// Scans executable sections for unambiguous console-only instruction sites.
+pub(crate) fn scan_code_sections<'a>(
+    funcs: &[(u32, u32)],
+    sections: impl IntoIterator<Item = (u32, &'a [u8])>,
+) -> Vec<AotSite> {
+    let mut sites = Vec::new();
+    for (sec_rva, code) in sections {
+        let mut i = 0usize;
+        while i < code.len() {
+            let tail = &code[i..];
+            if tail.len() >= 15
+                && let Some((ptr_reg, end_reg)) = decode::match_clzero_preinc_loop(tail)
+            {
+                sites.push(AotSite {
+                    rva: sec_rva as usize + i,
+                    len: 15,
+                    kind: AotKind::ClzeroPreIncLoop {
+                        code: tail[..15].try_into().unwrap(),
+                        ptr_reg,
+                        end_reg,
+                    },
+                });
+                i += 15;
+                continue;
+            }
+            if tail.len() >= 12 && decode::match_clzero_loop(tail).is_some() {
+                sites.push(AotSite {
+                    rva: sec_rva as usize + i,
+                    len: 12,
+                    kind: AotKind::ClzeroLoop {
+                        cmp: tail[7..10].try_into().unwrap(),
+                    },
+                });
+                i += 12;
+                continue;
+            }
+            if tail.len() >= 7 && tail[..7] == [0x31, 0xC9, 0x31, 0xD2, 0x0F, 0x01, 0xFA] {
+                let rva = sec_rva + i as u32 + 4;
+                if in_sorted_ranges(funcs, rva) {
+                    sites.push(AotSite {
+                        rva: rva as usize,
+                        len: 3,
+                        kind: AotKind::Wait {
+                            replacement: [0x0F, 0x1F, 0x00],
+                        },
+                    });
+                    i += 7;
+                    continue;
+                }
+            }
+            if tail.len() >= 5 && matches!(tail[0], 0x31 | 0x33) && tail[1..5] == [0xC0, 0x0F, 0x01, 0xFB] {
+                let rva = sec_rva + i as u32 + 2;
+                if in_sorted_ranges(funcs, rva) {
+                    sites.push(AotSite {
+                        rva: rva as usize,
+                        len: 3,
+                        kind: AotKind::Wait {
+                            replacement: [0xF3, 0x90, 0x90],
+                        },
+                    });
+                    i += 5;
+                    continue;
+                }
+            }
+            if tail.first().copied() == Some(0xF2)
+                && let Some((insn_len, dst, src, len, idx)) = decode::match_insertq_imm(tail)
+                && insn_len >= 5
+                && let Some(rva) = sec_rva.checked_add(i as u32)
+                && in_sorted_ranges(funcs, rva)
+            {
+                sites.push(AotSite {
+                    rva: rva as usize,
+                    len: insn_len,
+                    kind: AotKind::Insertq { dst, src, len, idx },
+                });
+                i += insn_len;
+                continue;
+            }
+            i += 1;
+        }
+    }
+    sites
+}
+
+fn tally_sites(sites: &[AotSite]) -> AotReport {
+    let mut r = AotReport::default();
+    for s in sites {
+        match s.kind {
+            AotKind::ClzeroLoop { .. } => r.clzero_loops += 1,
+            AotKind::ClzeroPreIncLoop { .. } => r.clzero_preinc_loops += 1,
+            AotKind::Wait { .. } => r.waits += 1,
+            AotKind::Insertq { .. } => r.insertq += 1,
+        }
+    }
+    r
+}
+
+/// Scans raw PE32+ bytes (an unpatched title exe or DLL) for statically
+/// translatable console-only instruction sites.
+pub fn scan_aot(original: &[u8]) -> Result<AotReport, victory_pe::PeError> {
+    let info = victory_pe::ImageInfo::parse(original)?;
+    let funcs = victory_pe::layout::data_directory_offset(original, victory_pe::layout::dir::EXCEPTION)
+        .and_then(|at| {
+            let rva = victory_pe::layout::read_u32(original, at)?;
+            let size = victory_pe::layout::read_u32(original, at + 4)?;
+            let off = info.rva_to_file_offset(rva)? as usize;
+            let pdata = original.get(off..off.checked_add(size as usize)?)?;
+            Some(parse_pdata(pdata))
+        })
+        .unwrap_or_default();
+    let sections: Vec<(u32, &[u8])> = info
+        .sections
+        .iter()
+        .filter(|s| s.characteristics & 0x2000_0000 != 0)
+        .filter_map(|s| {
+            let len = if s.virtual_size != 0 {
+                s.virtual_size.min(s.file_size)
+            } else {
+                s.file_size
+            } as usize;
+            let off = s.file_offset as usize;
+            let slice = original.get(off..off.checked_add(len)?)?;
+            Some((s.rva, slice))
+        })
+        .collect();
+    Ok(tally_sites(&scan_code_sections(&funcs, sections)))
+}
+
+fn clzero_preinc_stub(
+    at: usize,
+    stub: usize,
+    code: &[u8; 15],
+    ptr_reg: u8,
+    end_reg: u8,
+) -> Option<Vec<u8>> {
+    let scratch = [1u8, 2, 3].into_iter().find(|&r| r != ptr_reg && r != end_reg)?;
+    let mut out = Vec::with_capacity(96);
+    out.push(0x50 + scratch); // push scratch
+    let loop_start = out.len();
+    out.extend_from_slice(&code[0..3]); // mov rax, ptr_reg
+    out.extend_from_slice(&code[3..7]); // add ptr_reg, 0x40
+    out.extend([0x48, 0x89, 0xC0 | scratch]); // mov scratch, rax
+    out.extend([0x48, 0x83, 0xE0 | scratch, 0xC0]); // and scratch, -64
+    for k in 0..8u8 {
+        out.extend([0x48, 0xC7, 0x40 | scratch, k * 8, 0, 0, 0, 0]);
+    }
+    out.extend_from_slice(&code[10..13]); // cmp ptr_reg, end_reg
+    let back = (loop_start as i64) - (out.len() as i64 + 2);
+    out.extend([0x72, i8::try_from(back).ok()? as u8]); // jb loop_start
+    out.push(0x58 + scratch); // pop scratch (preserves EFLAGS)
+    out.extend(jump(stub + out.len(), at + 15)?);
+    Some(out)
+}
+
+fn insertq_stub(
+    at: usize,
+    stub: usize,
+    insn_len: usize,
+    dst: u8,
+    src: u8,
+    len: u8,
+    idx: u8,
+) -> Option<Vec<u8>> {
+    if dst >= 16 || src >= 16 || insn_len < 5 {
+        return None;
+    }
+    let len_bits = match len & 63 {
+        0 => 64u32,
+        n => u32::from(n),
+    };
+    let idx_bits = u32::from(idx & 63);
+    let ones = if len_bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << len_bits) - 1
+    };
+    let mask = ones.checked_shl(idx_bits).unwrap_or(0);
+    let movq_to_gp = |xmm: u8, gp: u8| -> [u8; 5] {
+        [
+            0x66,
+            0x48 | (u8::from(xmm >= 8) << 2),
+            0x0F,
+            0x7E,
+            0xC0 | ((xmm & 7) << 3) | (gp & 7),
+        ]
+    };
+    let movq_from_gp = |xmm: u8, gp: u8| -> [u8; 5] {
+        [
+            0x66,
+            0x48 | (u8::from(xmm >= 8) << 2),
+            0x0F,
+            0x6E,
+            0xC0 | ((xmm & 7) << 3) | (gp & 7),
+        ]
+    };
+    let mut out = Vec::with_capacity(80);
+    out.extend([0x9C, 0x50, 0x51, 0x52]); // pushfq; push rax; push rcx; push rdx
+    out.extend(movq_to_gp(dst, 0)); // movq rax, xmm(dst)
+    out.extend(movq_to_gp(src, 1)); // movq rcx, xmm(src)
+    if mask == u64::MAX {
+        out.extend([0x48, 0x89, 0xC8]); // mov rax, rcx
+    } else if mask != 0 {
+        out.extend([0x48, 0xBA]); // mov rdx, !mask
+        out.extend((!mask).to_le_bytes());
+        out.extend([0x48, 0x21, 0xD0]); // and rax, rdx
+        out.extend([0x48, 0xBA]); // mov rdx, ones
+        out.extend(ones.to_le_bytes());
+        out.extend([0x48, 0x21, 0xD1]); // and rcx, rdx
+        if idx_bits > 0 {
+            out.extend([0x48, 0xC1, 0xE1, idx_bits as u8]); // shl rcx, idx_bits
+        }
+        out.extend([0x48, 0x09, 0xC8]); // or rax, rcx
+    }
+    out.extend(movq_from_gp(dst, 0)); // movq xmm(dst), rax
+    out.extend([0x5A, 0x59, 0x58, 0x9D]); // pop rdx; pop rcx; pop rax; popfq
+    out.extend(jump(stub + out.len(), at + insn_len)?);
+    Some(out)
+}
+
+static AOT_STUBS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Applies `sites` statically into a single-threaded mapped image at `base`
+/// (`size` bytes).
+///
+/// # Safety
+/// `[base, base + size)` is mapped and no title thread executes it concurrently.
+pub(crate) unsafe fn apply_aot_sites(base: usize, size: usize, sites: &[AotSite]) -> AotReport {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut report = AotReport::default();
+    let mut stubs = AOT_STUBS.lock().unwrap_or_else(|e| e.into_inner());
+    for site in sites {
+        if site.rva.checked_add(site.len).is_none_or(|end| end > size) {
+            continue;
+        }
+        let at = base + site.rva;
+        let mut replacement = [0x90u8; 15];
+        match site.kind {
+            AotKind::Wait { replacement: wait } => {
+                if site.len != 3 {
+                    continue;
+                }
+                replacement[..3].copy_from_slice(&wait);
+                report.waits += 1;
+            }
+            AotKind::ClzeroLoop { .. }
+            | AotKind::ClzeroPreIncLoop { .. }
+            | AotKind::Insertq { .. } => {
+                if site.len < 5 || site.len > replacement.len() {
+                    continue;
+                }
+                const RESERVE: usize = 112;
+                let idx = stubs
+                    .iter()
+                    .position(|&(place, used)| {
+                        used + RESERVE <= STUBS_LEN
+                            && jump(at, place + used).is_some()
+                            && jump(place + used + RESERVE, at + site.len).is_some()
+                    })
+                    .or_else(|| {
+                        let place = near(at)?;
+                        stubs.push((place, 0));
+                        Some(stubs.len() - 1)
+                    });
+                let Some(idx) = idx else {
+                    continue;
+                };
+                let (place, used) = &mut stubs[idx];
+                let stub = *place + *used;
+                let body = match site.kind {
+                    AotKind::ClzeroLoop { cmp } => clzero_stub(at, stub, cmp),
+                    AotKind::ClzeroPreIncLoop {
+                        code,
+                        ptr_reg,
+                        end_reg,
+                    } => clzero_preinc_stub(at, stub, &code, ptr_reg, end_reg),
+                    AotKind::Insertq { dst, src, len, idx } => {
+                        insertq_stub(at, stub, site.len, dst, src, len, idx)
+                    }
+                    AotKind::Wait { .. } => unreachable!(),
+                };
+                let Some(body) = body else {
+                    continue;
+                };
+                if *used + body.len() > STUBS_LEN {
+                    continue;
+                }
+                let Some(jmp) = jump(at, stub) else {
+                    continue;
+                };
+                // SAFETY: `stub` lies inside our newly allocated RWX stub block.
+                unsafe { std::ptr::copy_nonoverlapping(body.as_ptr(), stub as *mut u8, body.len()) };
+                *used += body.len().next_multiple_of(16);
+                replacement[..5].copy_from_slice(&jmp);
+                match site.kind {
+                    AotKind::ClzeroLoop { .. } => report.clzero_loops += 1,
+                    AotKind::ClzeroPreIncLoop { .. } => report.clzero_preinc_loops += 1,
+                    AotKind::Insertq { .. } => report.insertq += 1,
+                    AotKind::Wait { .. } => unreachable!(),
+                }
+            }
+        }
+        let mut old = 0u32;
+        // SAFETY: `[at, at + site.len)` is inside the mapped image and no thread runs it yet.
+        unsafe {
+            if VirtualProtect(at as *const _, site.len, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+                continue;
+            }
+            std::ptr::copy_nonoverlapping(replacement.as_ptr(), at as *mut u8, site.len);
+            VirtualProtect(at as *const _, site.len, old, &mut old);
+            FlushInstructionCache(GetCurrentProcess(), at as *const _, site.len);
+        }
+        report.patched += 1;
+    }
+    report
+}
+
+/// Statically translates console-only CPU instructions in a freshly loaded
+/// image at `base` for the classes this host CPU lacks (unless
+/// `VICTORY_AOT_CPU=0`).
+///
+/// # Safety
+/// The image at `base` is mapped per `info` and no thread executes it yet.
+pub unsafe fn pretranslate_loaded(base: usize, info: &victory_pe::ImageInfo) -> AotReport {
+    if std::env::var_os("VICTORY_AOT_CPU").is_some_and(|v| v == "0") {
+        return AotReport::default();
+    }
+    let cpu = host_cpu_support();
+    if cpu.clzero && cpu.mwaitx && cpu.sse4a {
+        return AotReport::default();
+    }
+    let size = info.size_of_image as usize;
+    // SAFETY: PE headers at `base` up to `size` are mapped read-only by the OS loader.
+    let funcs = unsafe {
+        let header = std::slice::from_raw_parts(base as *const u8, size.min(0x2000));
+        victory_pe::layout::data_directory_offset(header, victory_pe::layout::dir::EXCEPTION)
+            .and_then(|at| {
+                let rva = victory_pe::layout::read_u32(header, at)? as usize;
+                let dir_len = victory_pe::layout::read_u32(header, at + 4)? as usize;
+                if rva == 0 || dir_len < 12 || rva.checked_add(dir_len)? > size {
+                    return None;
+                }
+                let pdata = std::slice::from_raw_parts((base + rva) as *const u8, dir_len);
+                Some(parse_pdata(pdata))
+            })
+            .unwrap_or_default()
+    };
+    let sections: Vec<(u32, &[u8])> = info
+        .sections
+        .iter()
+        .filter(|s| s.characteristics & 0x2000_0000 != 0)
+        .filter_map(|s| {
+            let len = if s.virtual_size != 0 {
+                s.virtual_size.min(s.file_size)
+            } else {
+                s.file_size
+            } as usize;
+            let end = (s.rva as usize).checked_add(len)?;
+            (end <= size).then(|| {
+                // SAFETY: executable section slice inside the mapped image.
+                (s.rva, unsafe { std::slice::from_raw_parts((base + s.rva as usize) as *const u8, len) })
+            })
+        })
+        .collect();
+    let mut sites = scan_code_sections(&funcs, sections);
+    sites.retain(|s| match s.kind {
+        AotKind::ClzeroLoop { .. } | AotKind::ClzeroPreIncLoop { .. } => !cpu.clzero,
+        AotKind::Wait { .. } => !cpu.mwaitx,
+        AotKind::Insertq { .. } => !cpu.sse4a,
+    });
+    if sites.is_empty() {
+        return AotReport::default();
+    }
+    // SAFETY: caller guarantees single-threaded mapped image before execution.
+    let report = unsafe { apply_aot_sites(base, size, &sites) };
+    tracing::info!(
+        clzero_loops = report.clzero_loops,
+        clzero_preinc = report.clzero_preinc_loops,
+        waits = report.waits,
+        insertq = report.insertq,
+        patched = report.patched,
+        "static AOT CPU translation applied"
+    );
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,5 +1127,180 @@ mod tests {
         }
         assert!(clzero_stub(0x1000, 0x2000, [0x48, 0x39, 0xc0]).is_none(), "against rax itself");
         assert!(jump(0x1000, 0x9000_0000_0000).is_none(), "out of reach");
+    }
+
+    #[test]
+    fn clzero_preinc_loop_becomes_plain_stores() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // Case A: ptr = r10, end = r11 (`mov rax, r10; add r10, 0x40; clzero; cmp r10, r11; jb -15`)
+        let loop_r10 = [
+            0x4C, 0x89, 0xD0, 0x49, 0x83, 0xC2, 0x40, 0x0F, 0x01, 0xFC, 0x4D, 0x39, 0xDA, 0x72, 0xF1,
+        ];
+        // Case B: ptr = rdx, end = r8 (`mov rax, rdx; add rdx, 0x40; clzero; cmp rdx, r8; jb -15`)
+        let loop_rdx = [
+            0x48, 0x89, 0xD0, 0x48, 0x83, 0xC2, 0x40, 0x0F, 0x01, 0xFC, 0x4C, 0x39, 0xC2, 0x72, 0xF1,
+        ];
+        for (which, loop_bytes) in [(0, loop_r10), (1, loop_rdx)] {
+            // SAFETY: fresh RWX buffer of our own, patched and called inside this test.
+            unsafe {
+                let page = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+                assert_ne!(page, 0);
+                // extern "C" fn(start: rcx, end: rdx, out_ptr: r8) -> rax
+                let mut code = Vec::new();
+                if which == 0 {
+                    // mov r10, rcx; mov r11, rdx
+                    code.extend([0x49, 0x89, 0xCA, 0x49, 0x89, 0xD3]);
+                } else {
+                    // mov r9, r8 (save out_ptr); mov r8, rdx (end); mov rdx, rcx (ptr)
+                    code.extend([0x4D, 0x89, 0xC1, 0x49, 0x89, 0xD0, 0x48, 0x89, 0xCA]);
+                }
+                let loop_rva = code.len();
+                code.extend_from_slice(&loop_bytes);
+                if which == 0 {
+                    code.extend([0x4D, 0x89, 0x10]); // mov [r8], r10
+                } else {
+                    code.extend([0x49, 0x89, 0x11]); // mov [r9], rdx
+                }
+                code.push(0xC3); // ret
+                std::ptr::copy_nonoverlapping(code.as_ptr(), page as *mut u8, code.len());
+                let sites = scan_code_sections(&[(0, code.len() as u32)], [(0, &code[..])]);
+                assert_eq!(sites.len(), 1);
+                let report = apply_aot_sites(page, 4096, &sites);
+                assert_eq!((report.clzero_preinc_loops, report.patched), (1, 1));
+                assert_eq!(*((page + loop_rva) as *const u8), 0xE9);
+
+                let mut block = vec![0xAAu8; 64 * 8 + 64];
+                let base = block.as_mut_ptr() as usize;
+                let first = base.next_multiple_of(64);
+                let run: extern "system" fn(usize, usize, *mut usize) -> usize = std::mem::transmute(page);
+                let mut final_ptr = 0usize;
+                let final_rax = run(first, first + 192, &raw mut final_ptr);
+                assert_eq!(final_rax, first + 128);
+                assert_eq!(final_ptr, first + 192);
+                let at = first - base;
+                assert!(block[at..at + 192].iter().all(|&b| b == 0));
+                assert!(block[..at].iter().chain(&block[at + 192..]).all(|&b| b == 0xAA));
+                VirtualFree(page as *mut _, 0, MEM_RELEASE);
+            }
+        }
+    }
+
+    #[test]
+    fn insertq_imm_stub_matches_emulation_and_preserves_state() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        #[repr(C, align(16))]
+        struct Io {
+            dst_in: [u64; 2],
+            src_in: [u64; 2],
+            dst_out: [u64; 2],
+            flags_before: u64,
+            flags_after: u64,
+        }
+        let cases: [(u8, u8, u8, u8, u64, u64); 5] = [
+            (0, 1, 16, 16, 0x1122_3344_5566_7788, 0xAAAA_BBBB_CCCC_DDDD),
+            (14, 13, 16, 16, 0x0102_0304_0506_0708, 0xFEDC_BA98_7654_3210),
+            (9, 7, 8, 24, 0xFFFF_FFFF_FFFF_FFFF, 0x0000_0000_0000_0042),
+            (4, 5, 0, 0, 0x1111_2222_3333_4444, 0x5555_6666_7777_8888),
+            (3, 3, 16, 48, 0x89AB_CDEF_0123_4567, 0x89AB_CDEF_0123_4567),
+        ];
+        for (dst, src, len, idx, dst_lo, src_lo) in cases {
+            // SAFETY: fresh RWX buffer of our own, patched and called inside this test.
+            unsafe {
+                let page = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+                assert_ne!(page, 0);
+                // extern "system" fn(io: *mut Io (rcx)) -> u64 (preserved rax check)
+                let movdqu_load = |xmm: u8, disp: u8| -> Vec<u8> {
+                    // F3 [44 if xmm>=8] 0F 6F [41 | (xmm&7)<<3] disp (load from [rcx+disp])
+                    let mut v = vec![0xF3];
+                    if xmm >= 8 {
+                        v.push(0x44);
+                    }
+                    v.extend([0x0F, 0x6F, 0x41 | ((xmm & 7) << 3), disp]);
+                    v
+                };
+                let movdqu_store = |xmm: u8, disp: u8| -> Vec<u8> {
+                    let mut v = vec![0xF3];
+                    if xmm >= 8 {
+                        v.push(0x44);
+                    }
+                    v.extend([0x0F, 0x7F, 0x41 | ((xmm & 7) << 3), disp]);
+                    v
+                };
+                let mut code = Vec::new();
+                code.extend(movdqu_load(dst, 0));
+                if src != dst {
+                    code.extend(movdqu_load(src, 16));
+                }
+                code.extend([0x48, 0xB8]); // mov rax, 0x1357_2468_ABCD_EF01
+                code.extend(0x1357_2468_ABCD_EF01u64.to_le_bytes());
+                code.extend([0x48, 0xBA, 0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01]); // mov rdx, ...
+                code.extend([0x48, 0x83, 0xFA, 0x00]); // cmp rdx, 0
+                code.extend([0x9C, 0x5A, 0x48, 0x89, 0x51, 48, 0x52, 0x9D]); // capture flags -> [rcx+48] and restore flags
+                let insn_rva = code.len();
+                code.push(0xF2);
+                let rex = (u8::from(dst >= 8) << 2) | u8::from(src >= 8);
+                if rex != 0 {
+                    code.push(0x40 | rex);
+                }
+                code.extend([0x0F, 0x78, 0xC0 | ((dst & 7) << 3) | (src & 7), len, idx]);
+                code.extend([0x9C, 0x5A, 0x48, 0x89, 0x51, 56]); // pushfq; pop rdx; mov [rcx+56], rdx
+                code.extend(movdqu_store(dst, 32)); // store [rcx+32] = dst_out
+                code.push(0xC3); // ret (returns rax)
+                std::ptr::copy_nonoverlapping(code.as_ptr(), page as *mut u8, code.len());
+                let sites = scan_code_sections(&[(0, code.len() as u32)], [(0, &code[..])]);
+                assert_eq!(sites.len(), 1, "expected 1 insertq site for dst={dst}, src={src}");
+                assert!(matches!(sites[0].kind, AotKind::Insertq { .. }));
+                let report = apply_aot_sites(page, 4096, &sites);
+                assert_eq!((report.insertq, report.patched), (1, 1));
+                assert_eq!(*((page + insn_rva) as *const u8), 0xE9);
+
+                let mut io = Io {
+                    dst_in: [dst_lo, 0xDEAD_BEEF_CAFE_BABE],
+                    src_in: [src_lo, 0x1122_3344_5566_7788],
+                    dst_out: [0, 1],
+                    flags_before: 0,
+                    flags_after: 1,
+                };
+                let run: extern "system" fn(*mut Io) -> u64 = std::mem::transmute(page);
+                let got_rax = run(&raw mut io);
+                assert_eq!(got_rax, 0x1357_2468_ABCD_EF01);
+                assert_eq!(io.dst_out[0], decode::insertq(dst_lo, src_lo, len, idx));
+                assert_eq!(io.dst_out[1], 0, "high quadword must be zeroed");
+                assert_eq!(io.flags_after, io.flags_before, "EFLAGS must be preserved");
+                VirtualFree(page as *mut _, 0, MEM_RELEASE);
+            }
+        }
+    }
+
+    #[test]
+    fn scan_ignores_call_displacements_and_finds_valid_sites() {
+        let mut code = Vec::new();
+        // False positive check 1: `call rel32` whose displacement contains `0f 01 fd` and `0f 01 fc`.
+        code.extend([0x89, 0xF9, 0xE8, 0xCA, 0x0F, 0x01, 0xFD]);
+        code.extend([0x89, 0xCF, 0xE8, 0x46, 0x0F, 0x01, 0xFC]);
+        // Valid 12-byte clzero loop
+        code.extend([0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x4C, 0x39, 0xD0, 0x72, 0xF4]);
+        // Valid 15-byte preinc clzero loop
+        code.extend([0x4C, 0x89, 0xD0, 0x49, 0x83, 0xC2, 0x40, 0x0F, 0x01, 0xFC, 0x4D, 0x39, 0xDA, 0x72, 0xF1]);
+        // Valid monitorx / mwaitx
+        code.extend([0x31, 0xC9, 0x31, 0xD2, 0x0F, 0x01, 0xFA]);
+        code.extend([0x31, 0xC0, 0x0F, 0x01, 0xFB]);
+        // Valid insertq inside function bounds
+        code.extend([0xF2, 0x44, 0x0F, 0x78, 0xCF, 0x08, 0x00]);
+        // Trailing bytes NOT in .pdata should be ignored for insertq
+        let fn_end = code.len() as u32;
+        code.extend([0xF2, 0x0F, 0x78, 0xC1, 0x10, 0x10]);
+
+        let sites = scan_code_sections(&[(0, fn_end)], [(0, &code[..])]);
+        let r = tally_sites(&sites);
+        assert_eq!(
+            (r.clzero_loops, r.clzero_preinc_loops, r.waits, r.insertq),
+            (1, 1, 2, 1),
+            "sites: {sites:?}"
+        );
     }
 }

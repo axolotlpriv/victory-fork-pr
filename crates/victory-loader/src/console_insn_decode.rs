@@ -84,6 +84,92 @@ fn modrm_len(b: &[u8]) -> Option<usize> {
     (b.len() >= len).then_some(len)
 }
 
+/// Matches a 12-byte `clzero` loop (`clzero; add rax, 0x40; cmp rax, end_reg; jb -12`),
+/// returning `end_reg` when `end_reg != 0`.
+pub fn match_clzero_loop(code: &[u8]) -> Option<u8> {
+    if code.len() < 12
+        || code[..7] != [0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40]
+        || (code[7] != 0x48 && code[7] != 0x4C)
+        || code[8] != 0x39
+        || code[10..12] != [0x72, 0xF4]
+    {
+        return None;
+    }
+    let modrm = code[9];
+    if modrm >> 6 != 3 || modrm & 7 != 0 {
+        return None;
+    }
+    let end_reg = ((modrm >> 3) & 7) | if code[7] == 0x4C { 8 } else { 0 };
+    (end_reg != 0).then_some(end_reg)
+}
+
+/// Matches a 15-byte pre-increment `clzero` loop
+/// (`mov rax, ptr; add ptr, 0x40; clzero; cmp ptr, end; jb -15`),
+/// returning `(ptr_reg, end_reg)`.
+pub fn match_clzero_preinc_loop(code: &[u8]) -> Option<(u8, u8)> {
+    let &[
+        rex_mov @ (0x48 | 0x4C),
+        0x89,
+        mod_mov,
+        rex_add @ (0x48 | 0x49),
+        0x83,
+        mod_add,
+        0x40,
+        0x0F,
+        0x01,
+        0xFC,
+        rex_cmp @ (0x48 | 0x49 | 0x4C | 0x4D),
+        0x39,
+        mod_cmp,
+        0x72,
+        0xF1,
+        ..
+    ] = code
+    else {
+        return None;
+    };
+    if mod_mov & 0xC7 != 0xC0 {
+        return None;
+    }
+    let ptr_reg = ((mod_mov >> 3) & 7) | ((rex_mov & 4) << 1);
+    if ptr_reg == 0 || mod_add != (0xC0 | (ptr_reg & 7)) || rex_add != if ptr_reg >= 8 { 0x49 } else { 0x48 } {
+        return None;
+    }
+    if mod_cmp >> 6 != 3 {
+        return None;
+    }
+    let cmp_rm = (mod_cmp & 7) | ((rex_cmp & 1) << 3);
+    let end_reg = ((mod_cmp >> 3) & 7) | ((rex_cmp & 4) << 1);
+    (cmp_rm == ptr_reg && end_reg != 0 && end_reg != ptr_reg).then_some((ptr_reg, end_reg))
+}
+
+/// Matches an SSE4a `insertq xmm(dst), xmm(src), imm8(len), imm8(idx)`
+/// instruction without legacy length assumptions, returning `(insn_len, dst, src, len, idx)`.
+pub fn match_insertq_imm(code: &[u8]) -> Option<(usize, u8, u8, u8, u8)> {
+    let (rex, at) = match *code.first()? {
+        0xF2 => match *code.get(1)? {
+            0x0F => (0u8, 1usize),
+            b @ 0x40..=0x4F if *code.get(2)? == 0x0F => (b, 2usize),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if *code.get(at + 1)? != 0x78 {
+        return None;
+    }
+    let modrm = *code.get(at + 2)?;
+    if modrm >> 6 != 3 {
+        return None;
+    }
+    let (&len, &idx) = (code.get(at + 3)?, code.get(at + 4)?);
+    if (len != 0 && len > 64) || idx >= 64 || (len != 0 && u32::from(len) + u32::from(idx) > 64) {
+        return None;
+    }
+    let dst = ((modrm >> 3) & 7) | ((rex & 4) << 1);
+    let src = (modrm & 7) | ((rex & 1) << 3);
+    Some((at + 5, dst, src, len, idx))
+}
+
 /// The console-only instruction at the start of `code` and its length.
 pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
     let mut i = 0;
@@ -117,17 +203,10 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
             // clzero (0F 01 FC); add rax, 0x40 (48 83 C0 40); cmp rax, <reg> ([48|4C] 39 modrm); jb -12 (72 F4)
             // (not after an 0x67: that CLZERO is at EAX, and the jb goes back to the 0F, past the
             // prefix – it is stepped alone, the loop is taken from the next one)
-            if code.len() >= i + 12
-                && !code[..i].contains(&0x67)
-                && code[i + 3..i + 7] == [0x48, 0x83, 0xC0, 0x40]
-                && (code[i + 7] == 0x48 || code[i + 7] == 0x4C)
-                && code[i + 8] == 0x39
-                && code[i + 10..i + 12] == [0x72, 0xF4]
+            if !code[..i].contains(&0x67)
+                && let Some(end_reg) = match_clzero_loop(&code[i..])
             {
-                let rex_r = code[i + 7] == 0x4C;
-                let modrm = code[i + 9];
-                let reg_idx = ((modrm >> 3) & 7) | if rex_r { 8 } else { 0 };
-                Some((ConsoleOnly::ClzeroLoop { end_reg: reg_idx }, i + 12))
+                Some((ConsoleOnly::ClzeroLoop { end_reg }, i + 12))
             } else {
                 Some((ConsoleOnly::Clzero, i + 3))
             }

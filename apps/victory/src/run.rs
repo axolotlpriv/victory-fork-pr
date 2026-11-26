@@ -234,6 +234,16 @@ pub fn run(
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
+    // SAFETY: imports are bound; translate console-only CPU instructions statically before execution.
+    let cpu_aot = unsafe { victory_loader::pretranslate_loaded(image.base(), image.info()) };
+    if cpu_aot.patched > 0 {
+        println!(
+            "cpu aot        translated {} clzero loops, {} waits, {} insertq sites (0 runtime traps)",
+            cpu_aot.clzero_loops + cpu_aot.clzero_preinc_loops,
+            cpu_aot.waits,
+            cpu_aot.insertq
+        );
+    }
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main
