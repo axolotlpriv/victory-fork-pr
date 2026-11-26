@@ -2231,3 +2231,41 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
         }
     }
 }
+
+#[test]
+fn v_dot8_i32_i4_executes_cleanly() {
+    let vop3p = |op: u16, opsel: u8, s0: u16, s1: u16, s2: u16| -> [u32; 2] {
+        [
+            0xCC00_0000 | (u32::from(op) << 16) | (u32::from(opsel & 7) << 11),
+            u32::from(s0 & 0x1FF) | (u32::from(s1 & 0x1FF) << 9) | (u32::from(s2 & 0x1FF) << 18),
+        ]
+    };
+    let [d8i_w0, d8i_w1] = vop3p(0x018, 0, vgpr(1), vgpr(2), vgpr(3));
+    let dot8_i4_shader = build_valu_cs(&[d8i_w0, d8i_w1]);
+    run_cases(
+        &dot8_i4_shader,
+        &[
+            [0xFFFF_FFFFu32, 0x7777_7777u32, 100u32, 0],
+            [0x8888_8888u32, 0x8888_8888u32, 0u32, 0],
+        ],
+        |backend, i, _inp, got| {
+            let want = [44, 512][i];
+            assert_eq!(got, want, "{backend}: v_dot8_i32_i4 case {i} got {got}, want {want}");
+        },
+    );
+    // Clamped overflow: 8 * (7 * 7) + (i32::MAX - 10) saturates to i32::MAX.
+    let [mut c_w0, c_w1] = vop3p(0x018, 0, vgpr(1), vgpr(2), vgpr(3));
+    c_w0 |= 1 << 15; // clamp = 1
+    let dot8_clamped = build_valu_cs(&[c_w0, c_w1]);
+    run_cases(
+        &dot8_clamped,
+        &[
+            [0x7777_7777u32, 0x7777_7777u32, (i32::MAX - 10) as u32, 0],
+            [0x8888_8888u32, 0x7777_7777u32, (i32::MIN + 10) as u32, 0],
+        ],
+        |backend, i, _inp, got| {
+            let want = [i32::MAX as u32, i32::MIN as u32][i];
+            assert_eq!(got, want, "{backend}: v_dot8_i32_i4 clamp case {i} got {got:#x}, want {want:#x}");
+        },
+    );
+}

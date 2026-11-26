@@ -719,8 +719,55 @@ impl Module {
             }
             Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => Effect::Writes,
             Op::Phi(_) => Effect::Lanes,
-            Op::Call(f, _) => effects[*f as usize],
+            Op::Call(f, args) => {
+                // `SLOT_MEMORY` and `SLOT_STRIDES` are host-built immutable root SRV
+                // lookup tables (`ROOT_CBV_SPACE`, SRV); shaders never modify them.
+                if effects[*f as usize] == Effect::Reads
+                    && self.funcs[*f as usize]
+                        .name
+                        .starts_with("dx.op.rawBufferLoad.")
+                    && self.is_immutable_internal_srv(args.get(1).copied())
+                {
+                    Effect::Pure
+                } else {
+                    effects[*f as usize]
+                }
+            }
         }
+    }
+
+    fn is_immutable_internal_srv(&self, mut handle: Option<V>) -> bool {
+        use super::super::shader::{ROOT_CBV_SPACE, SLOT_MEMORY, SLOT_STRIDES};
+        if let Some(V::Inst(a)) = handle
+            && let Op::Call(f, ref args) = self.insts[a as usize].op
+            && self.funcs[f as usize].name == "dx.op.annotateHandle"
+        {
+            handle = args.get(1).copied();
+        }
+        let Some(V::Inst(c)) = handle else {
+            return false;
+        };
+        let Op::Call(f, ref args) = self.insts[c as usize].op else {
+            return false;
+        };
+        if self.funcs[f as usize].name != "dx.op.createHandleFromBinding" {
+            return false;
+        }
+        let Some(V::Const(bind)) = args.get(1).copied() else {
+            return false;
+        };
+        let Const::Aggregate(fields) = &self.consts[bind as usize].1 else {
+            return false;
+        };
+        if fields.len() < 4 {
+            return false;
+        }
+        let reg = self.int_k(V::Const(fields[0])).map(|k| k.1);
+        let space = self.int_k(V::Const(fields[2])).map(|k| k.1);
+        let kind = self.int_k(V::Const(fields[3])).map(|k| k.1);
+        space == Some(u64::from(ROOT_CBV_SPACE))
+            && kind == Some(0)
+            && matches!(reg, Some(r) if r == u64::from(SLOT_MEMORY) || r == u64::from(SLOT_STRIDES))
     }
 
     fn key(&self, i: u32) -> Option<Key> {

@@ -164,7 +164,10 @@ pub fn helper_own() -> bool {
 /// thread: the group stands until Windows resets the card. (The console's
 /// barrier is the wave's, whatever lanes are live, and a wave that ended
 /// is not waited for.) `VICTORY_GROUP_SYNC`:
-/// - unset or `2`: every barrier waits, as before.
+/// - unset or `auto`: on hosts narrower than the console wave, the title's
+///   divergent barriers retain their memory fences but do not wait. Other
+///   hosts and uniform barriers keep their group sync.
+/// - `2`: every barrier waits, as before.
 /// - `1`: the title's `s_barrier` waits only in a block every lane runs,
 ///   in a program no lane can be cut out of at the iteration limit.
 /// - `0`: no barrier waits, neither the title's nor the ones the
@@ -176,12 +179,26 @@ pub fn helper_own() -> bool {
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn group_sync() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = TEST_GROUP_SYNC.get() {
+        return mode;
+    }
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_GROUP_SYNC").ok().as_deref().map(str::trim) {
+    *MODE.get_or_init(|| parse_group_sync(std::env::var("VICTORY_GROUP_SYNC").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_GROUP_SYNC: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+fn parse_group_sync(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
         Some("0") => 0,
         Some("1") => 1,
-        _ => 2,
-    })
+        Some("2") => 2,
+        _ => 3,
+    }
 }
 
 /// Whether buffer atomics of the ray-tracing structure builder stand between
@@ -3201,5 +3218,184 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    #[test]
+    fn group_sync_defaults_to_auto_and_keeps_explicit_overrides() {
+        for value in [None, Some("auto"), Some(""), Some("invalid")] {
+            assert_eq!(super::parse_group_sync(value), 3);
+        }
+        for (value, mode) in [("0", 0), (" 1 ", 1), ("2", 2)] {
+            assert_eq!(super::parse_group_sync(Some(value)), mode);
+        }
+    }
+
+    #[test]
+    fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
+        use super::host::{Draw, Host};
+        use crate::native::{Usage, VsInput};
+
+        let pos_sig = |name: &str, kind: u8, interp: u8| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let to_host = |native: &NativeProgram, inputs: Vec<SigElement>, outputs: Vec<SigElement>| {
+            let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir");
+            let st = structure::structure(&p).expect("structure");
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource");
+            let io = io::raise(&p, native).expect("io");
+            let l = lower::lower(&lower::Parts {
+                native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs,
+                outputs,
+                prims: Vec::new(),
+                mesh_stride: 0,
+            })
+            .expect("lower");
+            validate(&HostShader {
+                stage: native.stage,
+                dxil: l.dxil.clone(),
+                user_data: l.user_data.clone(),
+                samplers: l.samplers.clone(),
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs.clone(),
+                root_srvs: l.root_srvs.clone(),
+                root_uavs: l.root_uavs.clone(),
+                root_indexed_views: Vec::new(),
+            });
+            HostShader {
+                stage: native.stage,
+                dxil: l.dxil,
+                user_data: l.user_data,
+                samplers: l.samplers,
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+                root_uavs: l.root_uavs,
+                root_indexed_views: Vec::new(),
+            }
+        };
+
+        let vs_code: [u32; 3] = [
+            0xF800_08CF,
+            0x0706_0504, // exp pos0, v4, v5, v6, v7 done
+            0xBF81_0000, // s_endpgm
+        ];
+        let vs_native = NativeProgram {
+            stage: HwStage::Vs,
+            wave64: true,
+            vgprs: 8,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Vs {
+                inputs: vec![VsInput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    mask: 0xF,
+                    vgpr: 4,
+                }],
+                outputs: Vec::new(),
+            },
+            code: vs_code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let vs = to_host(
+            &vs_native,
+            vec![pos_sig("POSITION", 0, 0)],
+            vec![pos_sig("SV_Position", 3, 4)],
+        );
+
+        let ps_code: [u32; 35] = [
+            0xBE8C_0380, // s_mov_b32 s12, 0
+            0xBE94_047E, // s_mov_b64 s[20:21], exec
+            0x7C28_00F4, // v_cmpx_gt_f32 exec, 2.0, v0  (active for x < 2.0)
+            0x9390_FF09,
+            0x0002_001C, // s_bfe_u32 s16, s9, lit(0x0002001c) (packer)
+            0x9382_FF09,
+            0x000A_0000, // s_bfe_u32 s2, s9, lit(0x000a0000) (collision id)
+            0x9385_FF09,
+            0x000A_0010, // s_bfe_u32 s5, s9, lit(0x000a0010) (wave id)
+            0x8F10_8110, // s_lshl_b32 s16, s16, 1
+            0xBE84_0702, // s_not_b32 s4, s2
+            0x9000_9F09, // s_lshr_b32 s0, s9, 31 (overlap bit)
+            0x8810_8110, // s_or_b32 s16, s16, 1
+            0x8105_0405, // s_add_i32 s5, s5, s4
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xB990_1019, // s_setreg_b32 hwreg(HW_REG_POPS_PACKER, 0, 3), s16
+            0x8580_807E, // s_cselect_b64 s[0:1], exec, 0
+            0x8102_04EF, // s_add_i32 s2, src_pops_exiting_wave_id, s4
+            0xBF08_0502, // s_cmp_gt_u32 s2, s5
+            0x8582_807E, // s_cselect_b64 s[2:3], exec, 0
+            0x8880_0200, // s_or_b64 s[0:1], s[0:1], s[2:3]
+            0x87EA_007E, // s_and_b64 vcc, exec, s[0:1]
+            0xBF87_0005, // s_cbranch_vccnz +5
+            0xBF8E_FFFF, // s_sleep 0xffff
+            0x810C_810C, // s_add_i32 s12, s12, 1
+            0x8100_04EF, // s_add_i32 s0, src_pops_exiting_wave_id, s4
+            0xBF0A_0005, // s_cmp_lt_u32 s5, s0
+            0xBF84_FFFB, // s_cbranch_scc0 -5
+            0xBEFC_0380, // s_mov_b32 m0, 0
+            0xBF90_0007, // s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)
+            0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+            0x7E08_0C0C, // v_cvt_f32_u32 v4, s12
+            0xF800_180F,
+            0x0404_0404, // exp mrt0, v4, v4, v4, v4 done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let ps_bytes: Vec<u8> = ps_code.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let ps_native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: true,
+            vgprs: 8,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Ps {
+                inputs: Vec::new(),
+                input_addr: 1 << 8, // SV_Position.x in v0
+                db_shader_control: 1 << 16,
+                patches: Vec::new(),
+            },
+            code: ps_bytes,
+        };
+        let ps = to_host(
+            &ps_native,
+            vec![pos_sig("SV_Position", 3, 4)],
+            vec![pos_sig("SV_Target", 16, 0)],
+        );
+
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let host = Host::new(true).expect("WARP host");
+        let (root, pso) = host.pipeline(&vs, &ps).expect("pipeline");
+        let pixels = host
+            .draw(
+                &root,
+                &pso,
+                &Draw {
+                    roots: Vec::new(),
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &[
+                        -1.0, -1.0, 0.0, 1.0, -1.0, 3.0, 0.0, 1.0, 3.0, -1.0, 0.0, 1.0,
+                    ],
+                    stride: 16,
+                    size: (4, 1),
+                    mesh_groups: 0,
+                },
+            )
+            .expect("draw");
+        assert_eq!(pixels, vec![[0.0; 4], [0.0; 4], [1.0; 4], [1.0; 4]]);
     }
 }

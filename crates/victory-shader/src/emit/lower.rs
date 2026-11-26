@@ -62,6 +62,8 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    #[cfg(test)]
+    pub barrier_modes: Vec<u32>,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -259,6 +261,16 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+/// Per-block LDS hazard state when `split_lds` separates a console wave64 into two
+/// host waves of 32 lanes: avoids redundant barriers between consecutive LDS reads
+/// and immediately after an `s_barrier` or meeting barrier.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LdsState {
+    Clean,
+    Read,
+    Write,
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -330,6 +342,8 @@ struct Lower<'a> {
     fence_only: HashSet<usize>,
     /// A group barrier before every LDS access (a console wave run as two host waves).
     split_lds: bool,
+    /// Per-block LDS hazard state when `split_lds` is active.
+    lds_state: LdsState,
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
@@ -726,6 +740,59 @@ fn lane_uniform(
         }
         same.extend(next);
     }
+}
+
+/// Whether `v` is the same in every lane of its console wave in the
+/// surrounding control flow: constants, scalar reads, and lane operations
+/// whose inputs all are, through loop-carried phis. An LDS read at a
+/// uniform address counts: every lane asks for the same dword (the shader
+/// uses this for a wave's running scan).
+fn value_uniform(p: &Program, st: &Structured, v: Value, seen: &mut HashSet<Value>) -> bool {
+    if !seen.insert(v) {
+        return true;
+    }
+    for block in &p.blocks {
+        for phi in &block.phis {
+            if phi.value == v {
+                return phi
+                    .args
+                    .iter()
+                    .all(|&a| value_uniform(p, st, a, seen));
+            }
+        }
+        for inst in &block.insts {
+            if !inst.writes.iter().any(|&(_, w)| w == v) {
+                continue;
+            }
+            let name = inst.name();
+            let scalar_ok = |x: Value| !st.masks.contains_key(&x) && !st.highs.contains_key(&x);
+            let operand_ok = |op: &Operand, seen: &mut HashSet<Value>| match *op {
+                Operand::Vector { reg, .. } => inst
+                    .read(Reg::V(reg))
+                    .is_some_and(|x| value_uniform(p, st, x, seen)),
+                Operand::Scalar { code, .. } => inst
+                    .read(Reg::S(code))
+                    .is_none_or(&scalar_ok),
+                _ => true,
+            };
+            if name.starts_with("ds_read") {
+                let Fields::Ds { addr, .. } = &inst.fields else {
+                    return false;
+                };
+                return addr
+                    .as_ref()
+                    .is_none_or(|a| operand_ok(a, seen));
+            }
+            if name.starts_with("v_mbcnt") || name.contains("lane") || name.starts_with("v_cmpx") {
+                return false;
+            }
+            let Fields::Valu(val) = &inst.fields else {
+                return false;
+            };
+            return val.src.iter().all(|op| operand_ok(op, seen));
+        }
+    }
+    false
 }
 
 /// The thread id's x (`v0` on entry) of a console wave64 compute program whose console waves are
@@ -1756,6 +1823,29 @@ fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Opti
         .collect()
 }
 
+/// The title's barrier retains its memory fences even when group sync
+/// would wait for a host wave that never visits it. Explicit overrides
+/// keep their old meanings; automatic mode is restricted to single-console-wave
+/// groups (`group_threads <= console_wave`), so multi-console-wave groups
+/// never lose cross-wave synchronization.
+fn barrier_mode(
+    setting: u8,
+    host_wave: u32,
+    console_wave: u32,
+    group_threads: Option<u32>,
+    divergent: bool,
+    writes_uavs: bool,
+) -> u32 {
+    let single_console_wave = group_threads.is_some_and(|t| t <= console_wave);
+    let waits = match setting {
+        0 => false,
+        1 => !divergent,
+        2 => true,
+        _ => !(host_wave != 0 && host_wave < console_wave && single_console_wave && divergent),
+    };
+    8 | if writes_uavs { 2 } else { 0 } | u32::from(waits)
+}
+
 /// Pixel inputs packing two 16-bit rows per dword whose second row the
 /// metadata leaves out (`row2` = `row`): as for outputs
 /// ([`half_outputs`]), the next 16-bit row of the signature that no input
@@ -1897,9 +1987,10 @@ impl<'a> Lower<'a> {
                             split_lds = s.lds_dwords > 0 && group > 32;
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
-                                // numbers go through two exchange dwords past the program's LDS
+                                // numbers go through four exchange dwords past the program's LDS
+                                // (two pairs so `exchange_halves2` exchanges two values per barrier pair)
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                s.lds_dwords += 4 * group.div_ceil(64);
                             }
                         }
                     }
@@ -2097,6 +2188,7 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             split_lds,
+            lds_state: LdsState::Clean,
             lds_meet,
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
@@ -2605,8 +2697,7 @@ impl<'a> Lower<'a> {
                 need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
             }
-            let (lo0, lo1) = self.exchange_halves(self.cur, r_lo);
-            let (hi0, hi1) = self.exchange_halves(self.cur, r_hi);
+            let ((lo0, lo1), (hi0, hi1)) = self.exchange_halves2(self.cur, r_lo, r_hi);
             let c = self.cur;
             let d0 = self
                 .s
@@ -2826,9 +2917,11 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
-            if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
+            let enter = self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0);
+            if enter {
                 self.lds_meeting();
             }
+            self.lds_state = if b == 0 || enter { LdsState::Clean } else { LdsState::Write };
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
                 self.inst(b, i)?;
@@ -2844,6 +2937,7 @@ impl<'a> Lower<'a> {
             self.mask_ok = self.mask_data == MaskData::Console;
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].1) {
                 self.lds_meeting();
+                self.lds_state = LdsState::Clean;
             }
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
@@ -2864,6 +2958,8 @@ impl<'a> Lower<'a> {
             root_uavs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            barrier_modes: self.s.m.barrier_modes(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
@@ -2906,8 +3002,15 @@ impl<'a> Lower<'a> {
                     // paths only seem to allow it before any save: the lane of a VGPR
                     // nobody wrote, and VGPRs nobody set read as zero.
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
-                    // No wave overlaps this one (see `ordered_section`).
-                    None if self.pops_collision(v) => Val::I32(self.s.m.i32(0)),
+                    // The ordered section's collision id (overlap bit 31 clear,
+                    // wave id 1 in bits 16..25, collision id 0 in bits 0..9)
+                    // and (`operand`) the exiting wave id (0): wave id !=
+                    // collision id so `wave_id + ~collision_id` is 0 rather
+                    // than 0xffff_ffff and the wrap-around wait test
+                    // (`s_cmp_lt_u32 s5, s0`) exits immediately even if an
+                    // inactive lane falls through `s_cbranch_vccnz`; the host's
+                    // rasterizer-ordered views order the accesses instead.
+                    None if self.pops_collision(v) => Val::I32(self.s.m.i32(1 << 16)),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -4750,8 +4853,59 @@ impl<'a> Lower<'a> {
         (lo, hi)
     }
 
-    /// The first of the two exchange dwords of this thread's console wave (made in the entry
-    /// block): a group of several console waves has a pair for each.
+    /// Exchanges two wave-uniform values `(a, b)` between halves in a single
+    /// barrier pair (`exchange_pair` reserves 4 dwords per console wave: two
+    /// pairs so `b` uses `pair + 2 + half`). Cuts barriers from 4 to 2.
+    fn exchange_halves2(&mut self, at: usize, a: V, b: V) -> ((V, V), (V, V)) {
+        let Some((slot, small, _)) = self.exchange.as_ref().map(|(x, y, _)| (*x, *y, ())) else {
+            let z = self.s.m.i32(0);
+            return ((a, z), (b, z));
+        };
+        if small {
+            let z = self.s.m.i32(0);
+            return ((a, z), (b, z));
+        }
+        if self.local {
+            let cl = self.console_lane();
+            let (k32, z) = (self.s.m.i32(32), self.s.m.i32(0));
+            let upper = self.s.m.cmp(at, pred::IUGE, cl, k32);
+            let lo_a = self.s.m.select(at, upper, z, a);
+            let hi_a = self.s.m.select(at, upper, a, z);
+            let lo_b = self.s.m.select(at, upper, z, b);
+            let hi_b = self.s.m.select(at, upper, b, z);
+            return ((lo_a, hi_a), (lo_b, hi_b));
+        }
+        let pair = self.exchange_pair(slot);
+        let cl = self.console_lane();
+        let five = self.s.m.i32(5);
+        let half = self.s.m.bin(at, Bin::LShr, cl, five);
+        let idx_a = self.s.m.bin(at, Bin::Add, pair, half);
+        let two = self.s.m.i32(2);
+        let pair_b = self.s.m.bin(at, Bin::Add, pair, two);
+        let idx_b = self.s.m.bin(at, Bin::Add, pair_b, half);
+        let lds = self.s.lds();
+        let ptr_a = self.s.m.element(at, lds, idx_a);
+        let ptr_b = self.s.m.element(at, lds, idx_b);
+        self.s.m.store(at, ptr_a, a);
+        self.s.m.store(at, ptr_b, b);
+        self.group_sync(at);
+        let (one, three) = (self.s.m.i32(1), self.s.m.i32(3));
+        let k1 = self.s.m.bin(at, Bin::Add, pair, one);
+        let k3 = self.s.m.bin(at, Bin::Add, pair, three);
+        let p0 = self.s.m.element(at, lds, pair);
+        let p1 = self.s.m.element(at, lds, k1);
+        let p2 = self.s.m.element(at, lds, pair_b);
+        let p3 = self.s.m.element(at, lds, k3);
+        let lo_a = self.s.m.load(at, p0);
+        let hi_a = self.s.m.load(at, p1);
+        let lo_b = self.s.m.load(at, p2);
+        let hi_b = self.s.m.load(at, p3);
+        self.group_sync(at);
+        ((lo_a, hi_a), (lo_b, hi_b))
+    }
+
+    /// The first of the four exchange dwords of this thread's console wave (made in the entry
+    /// block): a group of several console waves reserves four dwords for each.
     fn exchange_pair(&mut self, slot: u32) -> V {
         if let Some(v) = self.pair {
             return v;
@@ -4760,10 +4914,10 @@ impl<'a> Lower<'a> {
         let thread = self.console_thread();
         let six = self.s.m.i32(6);
         let wave = self.s.m.bin(e, Bin::LShr, thread, six);
-        let one = self.s.m.i32(1);
-        let twice = self.s.m.bin(e, Bin::Shl, wave, one);
+        let two = self.s.m.i32(2);
+        let quad = self.s.m.bin(e, Bin::Shl, wave, two);
         let base = self.s.m.i32(slot);
-        let v = self.s.m.bin(e, Bin::Add, base, twice);
+        let v = self.s.m.bin(e, Bin::Add, base, quad);
         self.pair = Some(v);
         v
     }
@@ -5910,13 +6064,25 @@ impl<'a> Lower<'a> {
         if self.split_lds
             && matches!(inst.fields, Fields::Ds { .. })
             && !(name.starts_with("ds_swizzle") || name.contains("permute"))
-            && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
         {
-            // the two host waves of a console wave meet before each LDS access: what the other
-            // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
-            let void = self.s.t.void;
-            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            if self.lds_meet.as_ref().is_none_or(|(all, _)| all[b]) {
+                let lds_read = name.starts_with("ds_read");
+                let need = if lds_read {
+                    matches!(self.lds_state, LdsState::Write)
+                } else {
+                    !matches!(self.lds_state, LdsState::Clean)
+                };
+                if need {
+                    // the two host waves of a console wave meet before an LDS hazard:
+                    // what the other half wrote is visible, and what it still reads is not overwritten
+                    let mode = self.s.m.i32(meeting_mode());
+                    let void = self.s.t.void;
+                    self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                }
+                self.lds_state = if lds_read { LdsState::Read } else { LdsState::Write };
+            } else if !name.starts_with("ds_read") {
+                self.lds_state = LdsState::Write;
+            }
         }
         // The structure builder's threads take turns through atomics (a tree
         // built from its leaves up): what one wrote before its atomic is
@@ -5936,18 +6102,18 @@ impl<'a> Lower<'a> {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
-                let mut mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
-                // Without the wait for the group (bit 0) where not every
-                // lane arrives, or where the switch says so.
-                let waits = match super::group_sync() {
-                    0 => false,
-                    1 => !self.fence_only.contains(&b),
-                    _ => true,
-                };
-                if !waits {
-                    mode &= !1;
+                let mode_val = barrier_mode(
+                    super::group_sync(),
+                    host_max_wave(),
+                    self.wave(),
+                    self.s.threads.map(|t| t.iter().product()),
+                    self.fence_only.contains(&b),
+                    self.writes_uavs,
+                );
+                if mode_val & 1 != 0 {
+                    self.lds_state = LdsState::Clean;
                 }
-                let mode = self.s.m.i32(mode);
+                let mode = self.s.m.i32(mode_val);
                 let void = self.s.t.void;
                 self.s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -8823,6 +8989,52 @@ impl<'a> Lower<'a> {
                 );
                 int(self, r)
             }
+            "v_dot8_i32_i4" => {
+                // Eight signed nibble products (RDNA2 ISA): each nibble is
+                // moved to the top and shifted back arithmetically. Their sum
+                // lies in [-448, 512], so only adding the accumulator can
+                // overflow, and clamp saturates that add.
+                if v.omod != 0 {
+                    return Err("integer output modifiers");
+                }
+                let (s0, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let k28 = self.s.m.i32(28);
+                let mut dot = self.s.m.i32(0);
+                for i in 0..8 {
+                    let up = self.s.m.i32(28 - i * 4);
+                    let a = self.s.m.bin(c, Bin::Shl, s0, up);
+                    let a = self.s.m.bin(c, Bin::AShr, a, k28);
+                    let b = self.s.m.bin(c, Bin::Shl, s1, up);
+                    let b = self.s.m.bin(c, Bin::AShr, b, k28);
+                    let prod = self.s.m.bin(c, Bin::Mul, a, b);
+                    dot = self.s.m.bin(c, Bin::Add, dot, prod);
+                }
+                let r = if v.clamp {
+                    self.s.flags |= flags::INT64;
+                    let i64t = self.s.m.int(64);
+                    let d64 = self.s.m.cast(c, Cast::SExt, dot, i64t);
+                    let a64 = self.s.m.cast(c, Cast::SExt, s2, i64t);
+                    let sum = self.s.m.bin(c, Bin::Add, d64, a64);
+                    let min_v = self.s.m.int_const(i64t, i64::from(i32::MIN));
+                    let max_v = self.s.m.int_const(i64t, i64::from(i32::MAX));
+                    let lo = self.s.m.cmp(c, pred::SLT, sum, min_v);
+                    let s1 = self.s.m.select(c, lo, min_v, sum);
+                    let hi = self.s.m.cmp(c, pred::SGT, s1, max_v);
+                    let clamped = self.s.m.select(c, hi, max_v, s1);
+                    self.s.m.cast(c, Cast::Trunc, clamped, self.s.t.i32)
+                } else {
+                    self.s.m.bin(c, Bin::Add, dot, s2)
+                };
+                if !v.clamp {
+                    return int(self, r);
+                }
+                match v.dst {
+                    Some(Operand::Vector { reg, .. }) => self.write(inst, Reg::V(reg), r, guard),
+                    Some(Operand::Scalar { code, .. }) => self.write(inst, Reg::S(code), r, None),
+                    _ => return Err("a result without a register"),
+                }
+                Ok(())
+            }
             "v_mov_b32" => {
                 if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 {
                     let a = f(self, 0)?;
@@ -9490,7 +9702,10 @@ impl<'a> Lower<'a> {
                 // one, unless every lane holds the same value
                 let alike = match v.src.first() {
                     Some(&Operand::Vector { reg, .. }) => {
-                        inst.read(Reg::V(reg)).is_some_and(|x| self.uniform.contains(&x))
+                        inst.read(Reg::V(reg)).is_some_and(|x| {
+                            self.uniform.contains(&x)
+                                || value_uniform(self.x.p, self.x.st, x, &mut HashSet::new())
+                        })
                     }
                     _ => true,
                 };
@@ -9520,8 +9735,7 @@ impl<'a> Lower<'a> {
                     } else {
                         let i32t = self.s.t.i32;
                         let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
-                        let (lo_has, hi_has) = self.exchange_halves(c, has);
-                        let (lo, hi) = self.exchange_halves(c, mine);
+                        let ((lo_has, hi_has), (lo, hi)) = self.exchange_halves2(c, has, mine);
                         let z = self.s.m.i32(0);
                         let in_lo = self.s.m.cmp(c, pred::NE, lo_has, z);
                         let in_hi = self.s.m.cmp(c, pred::NE, hi_has, z);
@@ -14119,5 +14333,124 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn automatic_barriers_keep_fences_and_only_drop_unsafe_sync() {
+        for writes in [false, true] {
+            let fence = 8 | if writes { 2 } else { 0 };
+            for (host, console, threads, divergent, waits) in [
+                (32, 64, Some(64), true, false),
+                (32, 64, Some(64), false, true),
+                (32, 64, Some(128), true, true),
+                (32, 64, None, true, true),
+                (64, 64, Some(64), true, true),
+                (32, 32, Some(32), true, true),
+                (0, 64, Some(64), true, true),
+            ] {
+                assert_eq!(
+                    super::barrier_mode(3, host, console, threads, divergent, writes),
+                    fence | u32::from(waits),
+                );
+            }
+            assert_eq!(super::barrier_mode(0, 32, 64, Some(64), false, writes), fence);
+            assert_eq!(super::barrier_mode(1, 64, 64, Some(64), true, writes), fence);
+            assert_eq!(super::barrier_mode(1, 32, 64, Some(64), false, writes), fence | 1);
+            assert_eq!(super::barrier_mode(2, 32, 64, Some(64), true, writes), fence | 1);
+        }
+    }
+
+    #[test]
+    fn automatic_barrier_flags_reach_the_emitted_shader() {
+        let divergent = [
+            0x7D88_0090, // v_cmp_gt_u32 vcc, 16, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0001, // s_cbranch_execz past the barrier
+            0xBF8A_0000, // s_barrier
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        ];
+        let mut divergent32 = divergent;
+        divergent32[1] = 0xBE8C_3C6A; // s_and_saveexec_b32 s12, vcc_lo
+        divergent32[4] = 0xBEFE_030C; // s_mov_b32 exec_lo, s12
+        for (body, wave64, threads, host, expected) in [
+            (&divergent[..], true, 64, 32, 8),
+            (&divergent[..], true, 128, 32, 9),
+            (&divergent[..], true, 64, 64, 9),
+            (&divergent32[..], false, 64, 32, 9),
+            (&[0xBF8A_0000][..], true, 64, 32, 9),
+        ] {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64,
+                vgprs: 16,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo { rsrc2: 0, threads: [threads, 1, 1] }),
+                code: body.iter().copied().chain([S_ENDPGM])
+                    .flat_map(u32::to_le_bytes).collect(),
+            };
+            let p = ir::build(&native.code, wave64, native.vgprs).expect("IR");
+            let st = structure::structure(&p).expect("structure");
+            let res = resource::track(&p, &[], native.stage, Some(&st)).expect("resources");
+            let io = io::raise(&p, &native).expect("IO");
+            let old_wave = super::THREAD_MAX_WAVE.replace(Some(host));
+            let old_mode = super::super::TEST_GROUP_SYNC.replace(Some(3));
+            let shader = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            });
+            super::THREAD_MAX_WAVE.set(old_wave);
+            super::super::TEST_GROUP_SYNC.set(old_mode);
+            let shader = shader.unwrap_or_else(|e| panic!("wave64={wave64}, host={host}: {e:?}"));
+            assert_eq!(shader.barrier_modes, vec![expected]);
+        }
+    }
+
+    /// `v_dot8_i32_i4 v0, v1, v2, v3` decodes, and translates (clamped too)
+    /// in a program that stores its result, so it is not dropped as dead.
+    #[test]
+    fn signed_nibble_dot_product_translates() {
+        let dot = |clamp: u32| [0xCC18_4000 | clamp << 15, 0x101 | 0x102 << 9 | 0x103 << 18 | 3 << 27];
+        let program = |body: [u32; 2]| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            words.extend(body);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let code: Vec<u8> = program(dot(0)).iter().flat_map(|w| w.to_le_bytes()).collect();
+        let names: Vec<_> = crate::gfx10::decode(&code).unwrap().iter().map(|i| i.name()).collect();
+        assert!(names.contains(&Some("v_dot8_i32_i4")), "{names:?}");
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        for clamp in [0, 1] {
+            lower_with(
+                &program(dot(clamp)),
+                vec![constants, root(RootType::Table, 4, 1)],
+                vec![buffer],
+            )
+            .unwrap_or_else(|e| panic!("clamp {clamp}: {e}"));
+        }
     }
 }

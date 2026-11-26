@@ -710,55 +710,61 @@ impl Layout {
         let linear = self.desc.swizzle == Swizzle::LINEAR;
         // The row and depth contribute one common base to every column, so
         // the same contiguous runs repeat on every row, including mip tails.
-        let mut runs = Vec::new();
-        if !linear {
-            let mut first_linear = 0;
-            let mut first_tiled = self.column(m, 0) as usize;
-            for x in 1..m.width {
-                let offset = self.column(m, x) as usize;
-                let at = x as usize * n;
-                if offset != first_tiled + (at - first_linear) {
-                    runs.push((first_tiled, first_linear, at - first_linear));
-                    first_tiled = offset;
-                    first_linear = at;
-                }
-            }
-            runs.push((first_tiled, first_linear, bytes - first_linear));
+        thread_local! {
+            static RUNS: std::cell::RefCell<Vec<(usize, usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        // A mip can end partway through the last run. Check the other runs
-        // once so each row can copy them as fixed-size chunks.
-        let (body, last) = runs.split_at(runs.len().saturating_sub(1));
-        let chunk_size = body.first().map(|run| run.2).filter(|&size| {
-            body.iter()
-                .all(|&(offset, _, len)| len == size && offset.is_multiple_of(size))
-        });
-        for z in 0..depth {
-            let (s, inner) = self.split(first + z);
-            let base = u64::from(s) * self.slice_size + m.offset;
-            for y in 0..m.height {
-                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
-                if linear {
-                    let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
-                    copy_run::<DETILE>(src, dst, tiled_row as usize, linear_row, bytes);
-                } else {
-                    let tiled_row = (base + self.row(m, y, inner)) as usize;
-                    match chunk_size {
-                        Some(8) if tiled_row.is_multiple_of(8) => {
-                            copy_runs::<8, DETILE>(src, dst, body, tiled_row, linear_row)
-                        }
-                        Some(16) if tiled_row.is_multiple_of(16) => {
-                            copy_runs::<16, DETILE>(src, dst, body, tiled_row, linear_row)
-                        }
-                        Some(32) if tiled_row.is_multiple_of(32) => {
-                            copy_runs::<32, DETILE>(src, dst, body, tiled_row, linear_row)
-                        }
-                        _ => copy_runs::<0, DETILE>(src, dst, body, tiled_row, linear_row),
+        RUNS.with(|runs| {
+            let mut runs = runs.borrow_mut();
+            runs.clear();
+            if !linear {
+                let mut first_linear = 0;
+                let mut first_tiled = self.column(m, 0) as usize;
+                for x in 1..m.width {
+                    let offset = self.column(m, x) as usize;
+                    let at = x as usize * n;
+                    if offset != first_tiled + (at - first_linear) {
+                        runs.push((first_tiled, first_linear, at - first_linear));
+                        first_tiled = offset;
+                        first_linear = at;
                     }
-                    copy_runs::<0, DETILE>(src, dst, last, tiled_row, linear_row);
+                }
+                runs.push((first_tiled, first_linear, bytes - first_linear));
+            }
+            // A mip can end partway through the last run. Check the other runs
+            // once so each row can copy them as fixed-size chunks.
+            let (body, last) = runs.split_at(runs.len().saturating_sub(1));
+            let chunk_size = body.first().map(|run| run.2).filter(|&size| {
+                body.iter()
+                    .all(|&(offset, _, len)| len == size && offset.is_multiple_of(size))
+            });
+            for z in 0..depth {
+                let (s, inner) = self.split(first + z);
+                let base = u64::from(s) * self.slice_size + m.offset;
+                for y in 0..m.height {
+                    let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+                    if linear {
+                        let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
+                        copy_run::<DETILE>(src, dst, tiled_row as usize, linear_row, bytes);
+                    } else {
+                        let tiled_row = (base + self.row(m, y, inner)) as usize;
+                        match chunk_size {
+                            Some(8) if tiled_row.is_multiple_of(8) => {
+                                copy_runs::<8, DETILE>(src, dst, body, tiled_row, linear_row)
+                            }
+                            Some(16) if tiled_row.is_multiple_of(16) => {
+                                copy_runs::<16, DETILE>(src, dst, body, tiled_row, linear_row)
+                            }
+                            Some(32) if tiled_row.is_multiple_of(32) => {
+                                copy_runs::<32, DETILE>(src, dst, body, tiled_row, linear_row)
+                            }
+                            _ => copy_runs::<0, DETILE>(src, dst, body, tiled_row, linear_row),
+                        }
+                        copy_runs::<0, DETILE>(src, dst, last, tiled_row, linear_row);
+                    }
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 

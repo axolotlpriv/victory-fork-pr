@@ -466,6 +466,74 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
     Some(len)
 }
 
+fn pool_no_assert() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_NO_ASSERT").is_some_and(|v| v == "1"))
+}
+
+/// Returns true if `bytes` begins with a register-zeroing `xor reg, reg`
+/// (`xor r32, r32` or `xor r64, r64`) immediately following an empty-pool `int3`.
+fn xor_zero_after_int3(bytes: &[u8]) -> bool {
+    if bytes.first().copied() != Some(0xcc) {
+        return false;
+    }
+    let rest = &bytes[1..];
+    let Some(&first) = rest.first() else {
+        return false;
+    };
+    let (rex, op_bytes) = if (0x40..=0x4f).contains(&first) {
+        (first, &rest[1..])
+    } else {
+        (0, rest)
+    };
+    if rex != 0 && ((rex & 4 != 0) != (rex & 1 != 0)) {
+        return false;
+    }
+    let &[op, modrm, ..] = op_bytes else {
+        return false;
+    };
+    matches!(op, 0x31 | 0x33) && modrm >> 6 == 3 && ((modrm >> 3) & 7) == (modrm & 7)
+}
+
+/// With `VICTORY_POOL_NO_ASSERT=1`, continues past `int3` traps followed by
+/// `xor reg, reg` (the pool allocator's own null-return path).
+unsafe fn continue_empty_pool(info: *mut EXCEPTION_POINTERS) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    if !pool_no_assert() {
+        return false;
+    }
+    // SAFETY: the system passes valid exception pointers.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    if record.ExceptionCode != EXCEPTION_BREAKPOINT {
+        return false;
+    }
+    let at = record.ExceptionAddress as usize;
+    if at == 0 {
+        return false;
+    }
+    let n = (0x1000 - (at & 0xfff)).min(4);
+    if n < 3 {
+        return false;
+    }
+    let mut bytes = [0u8; 4];
+    // SAFETY: `n` bytes starting at the executed `ExceptionAddress` stay in its page.
+    unsafe { std::ptr::copy_nonoverlapping(at as *const u8, bytes.as_mut_ptr(), n) };
+    if !xor_zero_after_int3(&bytes[..n]) {
+        return false;
+    }
+    // SAFETY: the faulting thread's context, for the exception being dispatched.
+    let context = unsafe { &mut *(*info).ContextRecord };
+    if context.Rip as usize == at {
+        context.Rip += 1;
+    }
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    let hits = HITS.fetch_add(1, Ordering::Relaxed) + 1;
+    if hits <= 3 || hits.is_power_of_two() {
+        tracing::warn!(at = %locate(at), hits, "stepped over pool-empty int3 (VICTORY_POOL_NO_ASSERT=1)");
+    }
+    true
+}
+
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // an instruction of the console's CPU this one lacks: emulated, the title goes on
     // SAFETY: the system passes valid exception pointers.
@@ -477,7 +545,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         }
     }
     // SAFETY: the system passes valid exception pointers.
-    if unsafe { emulate_amd_only(info) } {
+    if unsafe { emulate_amd_only(info) } || unsafe { continue_empty_pool(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
@@ -1450,5 +1518,17 @@ mod tests {
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn pool_empty_xor_zero_pattern() {
+        assert!(xor_zero_after_int3(&[0xcc, 0x31, 0xc0]));
+        assert!(xor_zero_after_int3(&[0xcc, 0x33, 0xc0]));
+        assert!(xor_zero_after_int3(&[0xcc, 0x48, 0x31, 0xc0]));
+        assert!(xor_zero_after_int3(&[0xcc, 0x45, 0x31, 0xc0]));
+        assert!(!xor_zero_after_int3(&[0xcc, 0x44, 0x31, 0xc0]));
+        assert!(!xor_zero_after_int3(&[0xcc, 0x31, 0xc8]));
+        assert!(!xor_zero_after_int3(&[0x90, 0x31, 0xc0]));
+        assert!(!xor_zero_after_int3(&[0xcc, 0x48, 0x31]));
     }
 }
