@@ -216,6 +216,7 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
+    crate::rt_off::apply(title_dir);
     victory_loader::report_crashes();
     victory_loader::set_before_thread_shutdown(victory_hle::known_pipelines::flush);
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));

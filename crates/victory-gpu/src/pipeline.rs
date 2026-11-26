@@ -429,6 +429,10 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// One with a shader of [`drop_shaders`]: never made on the host, its
+    /// draws and dispatches not run.
+    #[cfg(windows)]
+    dropped: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -515,9 +519,46 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+/// Shader hashes whose pipelines are dropped ([`drop_shaders`]).
+#[cfg(windows)]
+static DROPPED_SHADERS: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+
+/// Pipelines made with any of these shaders (16-digit hashes, the first 8
+/// bytes of the container's BLAKE3, as in the pipeline diagnostics) are not
+/// made on the host, and their draws and dispatches are not run; in every
+/// build, unlike `VICTORY_SKIP_PIPELINES`. Set once, before the title makes
+/// pipelines (the front end's `VICTORY_RT_OFF=1`); later sets are ignored.
+pub fn drop_shaders(hashes: std::collections::HashSet<String>) {
+    #[cfg(windows)]
+    let _ = DROPPED_SHADERS.set(hashes);
+    #[cfg(not(windows))]
+    let _ = hashes;
+}
+
+/// Pipelines made dropped ([`drop_shaders`]).
+pub static DROPPED_PIPELINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+fn dropped(shaders: &[Arc<Shader>]) -> bool {
+    DROPPED_SHADERS
+        .get()
+        .is_some_and(|d| shaders.iter().any(|s| d.contains(&s.hash)))
+}
+
+/// Whether draws and dispatches of `this` are not run: dropped
+/// ([`drop_shaders`]) or, in diagnostics builds, skipped
+/// (`VICTORY_SKIP_PIPELINES`).
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
-    !this.is_null() && skipped_shader(pipeline(this)).is_some()
+    if this.is_null() {
+        return false;
+    }
+    let p = pipeline(this);
+    #[cfg(feature = "diagnostics")]
+    if skipped_shader(p).is_some() {
+        return true;
+    }
+    p.dropped
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
@@ -530,6 +571,7 @@ pub(crate) fn note_drop(this: This) {
         let p = pipeline(this);
         skipped_shader(p)
             .map(|hash| format!("skipped shader {hash}"))
+            .or_else(|| p.dropped.then(|| "ray tracing, off (VICTORY_RT_OFF)".to_owned()))
             .or_else(|| make::missing(&p.host))
     };
     if let Some(why) = why {
@@ -579,9 +621,15 @@ fn hand_out(
     #[cfg(windows)]
     known::note(host.key(), &shaders, host.graphics.as_deref());
     #[cfg(windows)]
-    make::early(&host);
+    let dropped = dropped(&shaders);
     #[cfg(windows)]
-    let builder = of_builder(&shaders);
+    if dropped {
+        DROPPED_PIPELINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        make::early(&host);
+    }
+    #[cfg(windows)]
+    let builder = !dropped && of_builder(&shaders);
     #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
@@ -596,6 +644,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        dropped,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });

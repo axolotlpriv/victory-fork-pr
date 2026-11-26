@@ -4180,6 +4180,40 @@ impl Host {
         })
     }
 
+    /// Short uppercase GPU name for the on-screen HUD (`fpsbox`).
+    pub(crate) fn gpu_label(&self) -> String {
+        let raw = self
+            .adapter
+            .as_ref()
+            .and_then(|a| unsafe { a.GetDesc1() }.ok())
+            .map(|d| {
+                let end = d
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(d.Description.len());
+                String::from_utf16_lossy(&d.Description[..end])
+            })
+            .unwrap_or_default();
+        let trimmed = raw
+            .trim()
+            .strip_prefix("NVIDIA GeForce ")
+            .or_else(|| raw.trim().strip_prefix("AMD Radeon "))
+            .or_else(|| raw.trim().strip_prefix("Intel(R) "))
+            .unwrap_or(raw.trim());
+        trimmed.to_ascii_uppercase()
+    }
+
+    /// Current local VRAM usage of this process in MiB, if DXGI reports it.
+    pub(crate) fn vram_used_mb(&self) -> Option<u32> {
+        use windows::Win32::Graphics::Dxgi::DXGI_MEMORY_SEGMENT_GROUP_LOCAL;
+        let adapter = self.adapter.as_ref()?;
+        let mut info = Default::default();
+        // SAFETY: live DXGI adapter3 and valid out-struct.
+        unsafe { adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info) }.ok()?;
+        Some((info.CurrentUsage >> 20).min(u64::from(u32::MAX)) as u32)
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         #[cfg(feature = "diagnostics")]
@@ -9207,6 +9241,7 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        crate::fpsbox::set(fps, ms, draws);
         // The lines (every second, and more every 5 s: sorting, system
         // calls, some forty lines written) are made by a thread of ours
         // ([`meter_lines`]), not by the presenting thread, the lane: about
@@ -9748,6 +9783,7 @@ impl Host {
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
+            crate::fpsbox::draw(self, list, &back, (width, height, format));
             #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]

@@ -279,10 +279,26 @@ impl GraphicsState {
 
     fn depth1(&self) -> D3D12_DEPTH_STENCIL_DESC1 {
         let d = &self.depth;
+        // WARP reports `DepthBoundsTestSupported = TRUE` yet skips the depth
+        // bounds check completely when `DepthEnable` is false. When a depth
+        // target format is present, `DepthEnable = TRUE` with `ALWAYS` and a
+        // zero write mask preserves `DepthEnable = FALSE` semantics while
+        // keeping `OMSetDepthBounds` active on both hardware GPUs and WARP.
+        let force_depth = self.depth_bounds
+            && !d.DepthEnable.as_bool()
+            && self.depth_format != DXGI_FORMAT_UNKNOWN;
         D3D12_DEPTH_STENCIL_DESC1 {
-            DepthEnable: d.DepthEnable,
-            DepthWriteMask: d.DepthWriteMask,
-            DepthFunc: d.DepthFunc,
+            DepthEnable: (d.DepthEnable.as_bool() || force_depth).into(),
+            DepthWriteMask: if force_depth {
+                D3D12_DEPTH_WRITE_MASK_ZERO
+            } else {
+                d.DepthWriteMask
+            },
+            DepthFunc: if force_depth {
+                D3D12_COMPARISON_FUNC_ALWAYS
+            } else {
+                d.DepthFunc
+            },
             StencilEnable: d.StencilEnable,
             StencilReadMask: d.StencilReadMask,
             StencilWriteMask: d.StencilWriteMask,
