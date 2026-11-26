@@ -1930,9 +1930,16 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
     let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
+    let title_limit = gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed);
+    let clamp = std::env::var_os("VICTORY_CLAMP_WORKING_SET").is_some_and(|v| v == "1");
+    let title_used = if clamp {
+        counters.PagefileUsage.min(title_limit * 3 / 4)
+    } else {
+        counters.PagefileUsage
+    };
     let stats = WorkingSet {
-        title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
-        title_used: counters.PagefileUsage,
+        title_limit,
+        title_used,
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };

@@ -764,7 +764,7 @@ impl Rig {
         // SAFETY: the source and names live through the call; then the
         // blob's own bytes, which hold the root signature too.
         let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
-            D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("inplace"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, None)?;
+            D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("inplace"), None, None, s!("main"), s!("cs_5_1"), 1 << 15, 0, &mut code, None)?;
             let code = code.ok_or_else(windows::core::Error::empty)?;
             let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
             let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;

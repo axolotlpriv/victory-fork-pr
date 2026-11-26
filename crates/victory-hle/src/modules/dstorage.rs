@@ -312,6 +312,28 @@ impl Io {
     const DEFAULT: Io = Io::Handles;
 }
 
+/// How many DirectStorage worker threads and parallel file handles to use.
+fn worker_count() -> usize {
+    if let Ok(v) = std::env::var("VICTORY_DSTORAGE_WORKERS")
+        && let Ok(n) = v.trim().parse::<usize>()
+        && n > 0
+    {
+        return n;
+    }
+    let total = std::thread::available_parallelism().map_or(4, |n| n.get());
+    if std::env::var_os("VICTORY_DISK_CORES").is_some_and(|v| v == "slow") {
+        #[cfg(windows)]
+        {
+            let slow = victory_gpu::cores::slow_core_count();
+            if slow > 0 {
+                return slow;
+            }
+        }
+        return (total / 2).clamp(4, 8);
+    }
+    total.clamp(4, 8)
+}
+
 /// A file as the workers read it: the handle the title opened, and those
 /// made from it when a worker first reads.
 struct Files {
@@ -322,7 +344,7 @@ struct Files {
 
 impl Files {
     fn new(first: std::fs::File, io: Io) -> Files {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = worker_count();
         let others = match io {
             Io::One => 0,
             Io::Overlapped => 1,
@@ -628,7 +650,7 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = worker_count();
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -773,6 +795,22 @@ pub(crate) mod stream_log {
 
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    #[cfg(windows)]
+    {
+        // Below the title's render/recording threads and GPU submit workers so
+        // decompression does not starve frame submission.
+        // SAFETY: plain priority adjustment on the calling thread.
+        unsafe {
+            use windows_sys::Win32::System::Threading::{
+                GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+            };
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        }
+        static SLOW: OnceLock<bool> = OnceLock::new();
+        if *SLOW.get_or_init(|| std::env::var_os("VICTORY_DISK_CORES").is_some_and(|v| v == "slow")) {
+            victory_gpu::cores::keep_on_slow_cores("dstorage worker");
+        }
+    }
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {

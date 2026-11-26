@@ -173,13 +173,24 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
+    if used < share(82) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+    } else if used < share(90) {
+        (IDLE_MS, used - share(78))
     } else {
-        (SHORT_MS, used - share(85))
+        (SHORT_MS, used - share(80))
     }
+}
+
+/// Host total physical RAM in bytes (`GlobalMemoryStatusEx`), if available.
+pub(crate) fn total_physical_ram() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data filled in by Windows.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: sized structure.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+    ok.then_some(m.ullTotalPhys).filter(|&b| b > 0)
 }
 
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
@@ -1497,7 +1508,7 @@ pub(crate) fn compile(
             None,
             entry,
             target,
-            0,
+            1 << 15,
             0,
             &mut code,
             Some(&mut errors),
@@ -4353,7 +4364,7 @@ impl Host {
                 None,
                 windows::core::s!("main"),
                 windows::core::s!("cs_5_1"),
-                0,
+                1 << 15,
                 0,
                 &mut code,
                 None,
@@ -11289,11 +11300,11 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     fn textures_are_kept_while_the_card_has_room() {
         use super::vram_keep;
         let gib = 1 << 30;
-        assert_eq!(vram_keep(100 * gib, 87 * gib).0, 600_000);
-        // Past it: the longest idle ones, enough to come down to 85 %.
-        let (ms, bytes) = vram_keep(100 * gib, 90 * gib);
-        assert_eq!((ms, bytes), (5_000, 5 * gib));
-        assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
+        assert_eq!(vram_keep(100 * gib, 81 * gib).0, 600_000);
+        // Past it: the longest idle ones, enough to come down.
+        assert_eq!(vram_keep(100 * gib, 85 * gib), (5_000, 7 * gib));
+        assert_eq!(vram_keep(100 * gib, 95 * gib), (1_500, 15 * gib));
+        assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 40 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
     }
 

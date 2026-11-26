@@ -42,15 +42,22 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
+    let keep = crate::host::keep_freed();
+    let staging_cap = if keep && crate::host::total_physical_ram().is_none_or(|b| b > 20 << 30) {
+        STAGING_KEPT
+    } else {
+        SPARE
+    };
+    lock(&STAGING).most = staging_cap;
     if !crate::residency::on() {
-        SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+        SPARES.store(spares(memory, keep), Ordering::Relaxed);
         return;
     }
     // (`VICTORY_RESIDENCY=1`, codec-d/cool_fox c64fc9b4/e94d277a: fewer
     // spares while the system is short of memory, and idle blocks let go now,
     // not at the pool's next allocation.)
     let pressure = crate::residency::pressured();
-    let limit = spares(memory, crate::host::keep_freed() && !pressure);
+    let limit = spares(memory, keep && !pressure);
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
     if let Ok(mut pool) = TEXTURES.try_lock() {
@@ -62,7 +69,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         } else if pressure {
             1
         } else {
-            limit
+            limit.min(staging_cap)
         };
         pool.reclaim(tick, staging_limit, true);
     }
@@ -70,7 +77,9 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => {
+            ((budget / 8) / BLOCK).clamp(SPARE as u64, SPARE_KEPT as u64) as usize
+        }
         _ => SPARE,
     }
 }
@@ -393,6 +402,12 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     if !on() {
         return None;
     }
+    static CAP: std::sync::Once = std::sync::Once::new();
+    CAP.call_once(|| {
+        if !crate::host::keep_freed() || crate::host::total_physical_ram().is_some_and(|b| b <= 20 << 30) {
+            lock(&STAGING).most = SPARE;
+        }
+    });
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
     let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
@@ -784,9 +799,12 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
-        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
+        const GIB: u64 = 1 << 30;
+        assert_eq!(spares(Some([6 * GIB, 4 * GIB, 0, 0]), true), 12);
+        assert_eq!(spares(Some([40 * GIB, 30 * GIB, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([40 * GIB, 35 * GIB, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([40 * GIB, 4 * GIB, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
     }
 

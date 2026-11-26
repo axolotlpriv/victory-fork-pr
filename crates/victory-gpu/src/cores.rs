@@ -148,6 +148,39 @@ fn fast_of(sets: &[(u32, u8, u8)]) -> Vec<u32> {
     fast_sets(sets, true)
 }
 
+/// The sets below the fastest class, if the processor has two kinds of cores.
+fn slow_of(sets: &[(u32, u8, u8)]) -> Vec<u32> {
+    let best = sets.iter().map(|c| c.1).max().unwrap_or(0);
+    sets.iter().filter(|c| c.1 < best).map(|c| c.0).collect()
+}
+
+/// How many logical processors belong to slower cores, or 0 if all cores are alike.
+pub fn slow_core_count() -> usize {
+    static SLOW: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    SLOW.get_or_init(|| slow_of(&cpu_sets())).len()
+}
+
+/// Asks the system to run the calling thread on slower cores, leaving fast cores
+/// for the title and GPU submit threads when the processor has two kinds of cores.
+pub fn keep_on_slow_cores(what: &str) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
+    static SLOW: std::sync::OnceLock<(Vec<u32>, usize)> = std::sync::OnceLock::new();
+    let (slow, of) = SLOW.get_or_init(|| {
+        let sets = cpu_sets();
+        (slow_of(&sets), sets.len())
+    });
+    if slow.is_empty() {
+        return;
+    }
+    // SAFETY: our own thread and a list of the system's own set ids.
+    let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), slow.as_ptr(), slow.len() as u32) };
+    if ok == 0 {
+        tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread could not be kept on the slow cores");
+    } else {
+        tracing::info!(what, slow = slow.len(), of, "the thread is kept on the slow cores");
+    }
+}
+
 /// The sets of one fast core of the last, and all the others, for
 /// [`lane_core`]; `None` with fewer than six fast cores.
 fn one_core(sets: &[(u32, u8, u8)]) -> Option<(Vec<u32>, Vec<u32>)> {
@@ -283,6 +316,9 @@ mod tests {
     fn the_fast_cores_are_those_of_the_best_class_if_there_is_a_worse_one() {
         assert_eq!(fast_by_class(&[(256, 1, 0), (257, 1, 0), (258, 0, 2)]), [256, 257]);
         assert!(fast_by_class(&[(256, 0, 0), (257, 0, 1)]).is_empty());
+        assert_eq!(slow_of(&[(256, 1, 0), (257, 1, 0), (258, 0, 2)]), [258]);
+        assert!(slow_of(&[(256, 0, 0), (257, 0, 1)]).is_empty());
+        assert!(slow_of(&[]).is_empty());
         assert!(one_core(&[(256, 1, 0), (257, 1, 0), (258, 0, 2)]).is_none());
         let eight: Vec<(u32, u8, u8)> = (0..16).map(|n| (n, 1, n as u8 / 2 * 2)).chain((16..24).map(|n| (n, 0, n as u8))).collect();
         let (own, others) = one_core(&eight).unwrap();

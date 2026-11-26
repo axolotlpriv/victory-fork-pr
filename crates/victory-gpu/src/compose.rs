@@ -67,7 +67,7 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
             None,
             entry,
             target,
-            0,
+            1 << 15,
             0,
             &mut code,
             None,
