@@ -1608,21 +1608,32 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 /// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
 /// (0: none): up to four times as many where the host heap has the room (a
 /// host that takes more than [`PORTABLE_VIEWS`]; `VICTORY_DYNAMIC_SLOTS`
-/// sets the most). 2^18 ran out in the title's bigger places (session
-/// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
-/// refused, with 2,639 indirect draws and dispatches).
-fn dynamic_slots(count: u32, null: u32) -> u32 {
-    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
-        std::env::var("VICTORY_DYNAMIC_SLOTS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DYNAMIC << 2)
-    });
+/// sets the most), and on a capped heap (`null < PORTABLE_VIEWS`) up to
+/// half of `null` when `VICTORY_DYNAMIC_SLOTS` asks for more than [`DYNAMIC`].
+fn dynamic_slots_on(count: u32, null: u32, asked: Option<u32>) -> u32 {
     if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+        let most = (null / 2).max(DYNAMIC);
+        return asked.unwrap_or(DYNAMIC).clamp(DYNAMIC, most);
     }
-    null.saturating_sub(count).min(most).max(DYNAMIC)
+    null.saturating_sub(count).min(asked.unwrap_or(DYNAMIC << 2)).max(DYNAMIC)
+}
+
+fn dynamic_slots(count: u32, null: u32) -> u32 {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    let asked = std::env::var("VICTORY_DYNAMIC_SLOTS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok());
+    let slots = dynamic_slots_on(count, null, asked);
+    if null < PORTABLE_VIEWS && slots != DYNAMIC {
+        LOGGED.call_once(|| {
+            tracing::warn!(
+                slots,
+                title_in_place = null.saturating_sub(slots),
+                "dynamic descriptor slots on a capped view heap (VICTORY_DYNAMIC_SLOTS)"
+            );
+        });
+    }
+    slots
 }
 
 impl HostHeap {
@@ -6075,6 +6086,18 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn dynamic_slots_stay_within_half_a_capped_heap() {
+        assert_eq!(dynamic_slots_on(0, 0, Some(524_288)), DYNAMIC);
+        assert_eq!(dynamic_slots_on(0, 999_999, None), DYNAMIC);
+        assert_eq!(dynamic_slots_on(0, 999_999, Some(278_528)), 278_528);
+        assert_eq!(dynamic_slots_on(0, 999_999, Some(700_000)), 499_999);
+        assert_eq!(dynamic_slots_on(0, 800_000, Some(524_288)), 400_000);
+        assert_eq!(dynamic_slots_on(0, 999_999, Some(1)), DYNAMIC);
+        assert_eq!(dynamic_slots_on(1_050_000, 2_097_151, None), 1_047_151);
+        assert_eq!(dynamic_slots_on(1_000_000, 2_097_151, None), DYNAMIC << 2);
     }
 
     #[test]

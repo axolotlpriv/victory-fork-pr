@@ -38,13 +38,19 @@ struct TableGroup {
     has_uav: bool,
     max_dword: u32,
     entries: Vec<UsedResource>,
+    writes: Vec<bool>,
     indexed: Vec<RootIndexedView>,
-    // Descriptor number -> first declaration, matching the bind-time search.
-    by_descriptor: Vec<(u32, usize)>,
+    // Descriptor number -> (first declaration index, whether any declaration at this descriptor writes).
+    by_descriptor: Vec<(u32, usize, bool)>,
 }
 
 impl TablePlan {
-    pub(crate) fn new(used: &[UsedResource], indexed: &[RootIndexedView]) -> Self {
+    pub(crate) fn new(
+        used: &[UsedResource],
+        indexed: &[RootIndexedView],
+        written: &[bool],
+        write_unknown: bool,
+    ) -> Self {
         let mut slots: Vec<_> = used
             .iter()
             .filter(|u| u.root == RootType::Table)
@@ -60,12 +66,17 @@ impl TablePlan {
                 has_uav: false,
                 max_dword: 0,
                 entries: Vec::new(),
+                writes: Vec::new(),
                 by_descriptor: Vec::new(),
                 indexed: indexed.iter().filter(|v| v.table_slot == slot).copied().collect(),
             })
             .collect();
         let mut direct = Vec::new();
-        for &u in used.iter().filter(|u| u.root == RootType::Table) {
+        for (idx, &u) in used.iter().enumerate() {
+            if u.root != RootType::Table {
+                continue;
+            }
+            let writes = write_unknown || written.get(idx).copied().unwrap_or(true);
             let i = slots
                 .binary_search(&u.slot)
                 .expect("table slot collected from these declarations");
@@ -76,24 +87,34 @@ impl TablePlan {
             direct.push((i, group.entries.len()));
             group
                 .by_descriptor
-                .push((u.table_offset_dwords / 8, group.entries.len()));
+                .push((u.table_offset_dwords / 8, group.entries.len(), writes));
             group.entries.push(u);
+            group.writes.push(writes);
         }
         for group in &mut groups {
-            group.by_descriptor.sort_unstable();
-            group.by_descriptor.dedup_by_key(|item| item.0);
+            group.by_descriptor.sort_unstable_by_key(|item| (item.0, item.1));
+            let mut merged: Vec<(u32, usize, bool)> = Vec::with_capacity(group.by_descriptor.len());
+            for item in group.by_descriptor.drain(..) {
+                if let Some(last) = merged.last_mut().filter(|last| last.0 == item.0) {
+                    last.2 |= item.2;
+                } else {
+                    merged.push(item);
+                }
+            }
+            group.by_descriptor = merged;
         }
         Self { groups, direct }
     }
 }
 
 impl TableGroup {
-    fn entry(&self, descriptor: u32) -> Option<&UsedResource> {
+    fn entry(&self, descriptor: u32) -> Option<(&UsedResource, bool)> {
         let i = self
             .by_descriptor
             .binary_search_by_key(&descriptor, |item| item.0)
             .ok()?;
-        Some(&self.entries[self.by_descriptor[i].1])
+        let (_, idx, writes) = self.by_descriptor[i];
+        Some((&self.entries[idx], writes))
     }
 
     fn needs_snapshot(&self, heap: &crate::descriptor::Heap, host_count: u32, table: u64) -> bool {
@@ -154,6 +175,9 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// While a table descriptor is bound: whether this binding may be
+    /// written, derived from the store instruction's descriptor when known.
+    static BINDING_WRITES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -1621,10 +1645,12 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            BINDING_WRITES.set(t.stores);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
             let made = self.tables(list, &t.tables, compute);
+            BINDING_WRITES.set(true);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -3369,7 +3395,7 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&self, list: &HostList, u: &UsedResource, writes: bool, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -3381,6 +3407,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
+            BINDING_WRITES.set(writes);
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
@@ -3427,7 +3454,7 @@ impl State {
         for &(g, e) in &plan.direct {
             let group = &plan.groups[g];
             if !selected_slot(&fresh, group.slot) {
-                self.table_entry(list, &group.entries[e], compute);
+                self.table_entry(list, &group.entries[e], group.writes[e], compute);
             }
         }
         let mut made = Few::default();
@@ -3502,9 +3529,10 @@ impl State {
                 }
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for (u, &writes) in entries.iter().zip(&group.writes).filter(|(u, _)| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
+                        BINDING_WRITES.set(writes);
                         readable(list, u.kind, &view);
                     }
                 }
@@ -3516,6 +3544,7 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
+                        BINDING_WRITES.set(STORES.get());
                         readable(list, kind, &view);
                     }
                 }
@@ -3572,10 +3601,11 @@ impl State {
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
                     && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
-                    let kind = group
-                        .entry(k)
-                        .map(|u| u.kind)
+                    let entry = group.entry(k);
+                    let kind = entry
+                        .map(|(u, _)| u.kind)
                         .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
+                    let writes = entry.map_or_else(|| STORES.get(), |(_, w)| w);
                     let was = (listed.ready, listed.tabled);
                     if let Some(kind) = kind {
                         let tested = TESTED_DEPTH.get();
@@ -3585,6 +3615,7 @@ impl State {
                             }
                         } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
                             TESTED_DEPTH.set((tested.0, false));
+                            BINDING_WRITES.set(writes);
                             readable(list, kind, &view);
                             let depth = TESTED_DEPTH.get().1;
                             TESTED_DEPTH.set((tested.0, tested.1 || depth));
@@ -3635,10 +3666,12 @@ impl State {
                     }
                     Some(view) => {
                         host.make_at(index, &view);
-                        let kind = used.map(|u| u.kind).or_else(|| {
-                            selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
-                        });
+                        let (kind, writes) = match used {
+                            Some((u, w)) => (Some(u.kind), w),
+                            None => (selected.binary_search(&k).ok().and_then(|_| view_kind(&view)), STORES.get()),
+                        };
                         if let Some(kind) = kind {
+                            BINDING_WRITES.set(writes);
                             readable(list, kind, &view);
                         }
                         // The title's slot is a table's: out of the queue
@@ -4385,9 +4418,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
-            // A shader that cannot store to buffers leaves the range as
-            // the title has it: nothing to find afterwards.
-            if STORES.get() || !write_skip() {
+            // A shader that cannot store to buffers (or stores only to another
+            // descriptor) leaves the range as the title has it.
+            if (BINDING_WRITES.get() && STORES.get()) || !write_skip() {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(address, len, 0);
                 shadow.gpu_writes(list, address, len);
